@@ -8,7 +8,7 @@ Diagrams are embedded below; the PDF contains the typeset figures.
 
 ### Abstract
 
-WSR combines a full-resolution wide residual trunk with a quarter-resolution context stream. The context stream reads pixel-unshuffled RGB, receives a midpoint feature merge, and modulates the trunk through scheduled channel-wise gates. Default and Compact additionally use Halo retrieval: independent pixel queries attend to learned block keys and values over overlapping 64 x 64 donor supports, while each query belongs to a 32 x 32 tile. Linear Conv3XC branches expand the training parameterization and fold into dense convolutions for deployment. Two linear RGB chains in the attention-enabled backbone fold to 5 x 5 kernels. Five presets support native 1x, 2x, and 4x output. This report defines the current consolidated architecture, including boundary masks, staged initialization, folding, and numerical contracts. It is an implementation description, not a new empirical quality or speed comparison.
+WSR is a single-image restoration architecture that combines a full-resolution wide residual trunk with a quarter-resolution context stream. The context stream reads pixel-unshuffled RGB, receives a midpoint feature merge, and modulates the trunk through scheduled channel-wise gates. Default and Compact additionally use Halo retrieval: independent pixel queries attend to learned block keys and values over overlapping 64 x 64 donor supports, while each query belongs to a 32 x 32 tile. Linear Conv3XC branches expand the training parameterization and fold into dense convolutions for deployment. Two linear RGB chains in the attention-enabled backbone fold to 5 x 5 kernels. Five presets support native 1x, 2x, and 4x output. This report details the architecture, boundary masks, staged initialization, and training and deployment behavior.
 
 ```mermaid
 flowchart TB
@@ -33,8 +33,6 @@ flowchart TB
 ### 1  Design rationale
 
 A narrow residual state can coexist with a wider nonlinear transformation [1]. WSR applies that idea with foldable linear projections, then introduces two complementary context mechanisms: coarse spatial conditioning and content-selected Halo donors. Coarse features need not preserve every high-frequency detail because the trunk retains the original LR grid. Halo adds nonlocal selection within bounded support without pooling the queries.
-
-The current WSR is the consolidated Halo design. Earlier experimental alternatives are not part of this release. The architecture is single-image, not temporal. It contains no optical flow, discriminator, teacher model, or fixed GAN objective. All diagrams are original schematics rather than measured activations or restoration examples.
 
 ## 2  Presets and full-resolution trunk
 
@@ -121,7 +119,7 @@ For D trunk stages and S gates, gate positions are p<sub>j</sub>=ceil(jD/S), j=1
 
 Gate(z,c) = z ⊙ [2 sigmoid(γ(c) + a ⊙ z)] + β(c).   (5)
 
-The projection weights, projection bias, and per-channel local coefficient a start at zero. Since 2 sigmoid(0)=1, the initial gate is identity. This is a bounded multiplicative gain, not a hard mask; beta provides an additive path. With zero projection weights, the gate initially sends no data gradient back into context features, although its output projections can learn. Opening these paths is part of the initialization, not evidence that every component learns on the first update.
+The projection weights, projection bias, and per-channel local coefficient a start at zero. Since 2 sigmoid(0)=1, the initial gate is identity. This is a bounded multiplicative gain, not a hard mask; beta provides an additive path. With zero projection weights, the gate initially sends no data gradient back into context features, although its output projections can learn.
 
 | Preset | Merge | Gate stages | Context stages* | Halo stage |
 |---|---|---|---|---|
@@ -201,9 +199,9 @@ The boundary rule is essential. The training path zero-pads the input before the
 
 ### 5.1  Effective 5 x 5 RGB paths
 
-Default and Compact contain two FoldableRGB5 modules: one feeds the first wide expansion and one supplies the additive reconstruction base. Each composes two valid 3 x 3 Conv3XC operators after a single two-pixel input pad. The skip in a valid operator is cropped by one pixel. No intermediate nonlinearity is present, so the full chain folds to a single 5 x 5 convolution. This rule is not a license to fuse arbitrary separately padded convolution chains.
+Default and Compact contain two FoldableRGB5 modules: one feeds the first wide expansion and one supplies the additive reconstruction base. Each composes two valid 3 x 3 Conv3XC operators after a single two-pixel input pad. The skip in a valid operator is cropped by one pixel. No intermediate nonlinearity is present, so the full chain folds to a single 5 x 5 convolution.
 
-Export composition uses FP64 before casting back to the source dtype. The larger training parameterization disappears, but trained wide features around ReLU, gates, context, and Halo remain. The algebra does not guarantee a quality improvement from reparameterization, bitwise FP16/BF16 parity, or any particular engine speedup. The optimization trajectory differs from training the folded weights directly.
+Export composition uses FP64 before casting back to the source dtype. Linear factors fold away; wide activations, ReLU, gates, context, and Halo remain. Floating-point rounding can differ between the explicit and folded forms. Training the factors also follows a different optimization trajectory from training the folded kernel directly.
 
 ## 6  Precision, deployment, and limitations
 
@@ -219,17 +217,17 @@ Table 3. Evaluation alone is not the same as permanent export preparation. The e
 
 During non-deployed attention, Q/K score arithmetic and softmax use a dtype promoted with FP32 and autocast disabled; probabilities are then cast to the value dtype. Export caches the clamped temperature and executes the matmul-softmax-matmul expression in model dtype. This supports low-precision backend optimization but is not a claim of identical numerical results. Validate the selected precision and engine against the appropriate reference.
 
-Call eval() on a separate model copy before prepare_for_export(). This folds the linear branches in place and marks attention deployed; it is idempotent but not reversible. Keep the unfolded checkpoint and optimizer state for training. The method does not build an ONNX graph or TensorRT engine. The release contains no engine/plugin and makes no hardware-specific throughput promise.
+Call eval() on a separate model copy before prepare_for_export(). This folds the linear branches in place and marks attention deployed; it is idempotent but not reversible. Keep the unfolded checkpoint and optimizer state for training. The method does not build an ONNX graph or TensorRT engine.
 
 ### 6.2  Integration and checkpoint scope
 
-wsr_arch.py includes Conv3XC and the attention/context components. It is drop-in architecture code for traiNNer, not a bundled trainer: its registry import requires traiNNer.utils.registry. Copy it into traiNNer/archs, avoid duplicate modules registering the same names, and select the matching factory and scale. Loading strictly is appropriate for matching unfolded checkpoints. Folded states require the corresponding deployment structure, not the original training module.
+wsr_arch.py includes Conv3XC and the attention/context components and uses traiNNer.utils.registry for registration. Copy it into traiNNer/archs and select the matching factory and scale. Avoid duplicate modules registering the same names. Load matching unfolded checkpoints strictly; folded states require the deployment structure.
 
-### 6.3  Boundaries and evidence
+### 6.3  Finite-image behavior
 
-Learned 4 x 4 K/V tokens compress information; independent queries do not recover information that the projections discard. Coarse context adds spatial conditioning but is not an image-wide attention map. Halo retains query-tile support changes and variable valid-key counts. PU4, convolution padding, context interpolation, and tile alignment affect finite-image behavior. These mechanisms do not prove freedom from GAN artifacts, ringing, or texture hallucination.
+Learned 4 x 4 K/V tokens compress information; independent queries do not recover information that the projections discard. Coarse context adds spatial conditioning but is not an image-wide attention map. Halo retains query-tile support changes and variable valid-key counts. PU4, convolution padding, context interpolation, and tile alignment affect finite-image behavior.
 
-No new training, quality benchmark, GPU experiment, or timing study was performed for this report. A future comparison must fix the degradation, crop, effective batch, optimizer, losses, schedule, seed policy, and validation convention. Runtime evidence must state precision, folded state, image shape, batch, hardware, backend, warmup, and timing scope. Parameter count and MAC count are not latency measurements.
+This report describes the architecture; it does not present quality or runtime benchmarks.
 
 ## 7  Implementation map
 
@@ -246,18 +244,12 @@ No new training, quality benchmark, GPU experiment, or timing study was performe
 
 Table 4. The file is organized in dependency order: linear components, context, Halo, complete backbones, then registered presets.
 
-### Release scope
-
-The accompanying source is the current five-preset WSR family. It includes no Wide13, EDBB, or K6/V4 experimental variant, no pretrained weights, and no private dataset paths. Documentation describes the shipped behavior without promoting discarded experiments into supported features. The paper and readable text are versioned together with the code.
-
-Author: Rift73. Documentation and original schematic preparation were assisted by Codex, with a visual-design review by Claude Opus 5.5. This paper contains the architecture explanation, diagrams, and integration notes; applicable code notices are consolidated in LICENSE.
-
 ### References
 
-[1] J. Yu et al. Wide Activation for Efficient and Accurate Image Super-Resolution. 2018. [arXiv:1808.08718](https://arxiv.org/abs/1808.08718). Wide activation is a conceptual antecedent; WSR does not reproduce the WDSR model or its measurements.
+[1] J. Yu et al. Wide Activation for Efficient and Accurate Image Super-Resolution. 2018. [arXiv:1808.08718](https://arxiv.org/abs/1808.08718).
 
-[2] C. Wan et al. Swift Parameter-free Attention Network for Efficient Super-Resolution. 2023. [arXiv:2311.12770](https://arxiv.org/abs/2311.12770); [official SPAN code](https://github.com/hongyuanyu/SPAN). Conv3XC implementation lineage, carried through spandrel/traiNNer integration.
+[2] C. Wan et al. Swift Parameter-free Attention Network for Efficient Super-Resolution. 2023. [arXiv:2311.12770](https://arxiv.org/abs/2311.12770); [official SPAN code](https://github.com/hongyuanyu/SPAN).
 
-[3] A. Vaswani et al. Scaling Local Self-Attention for Parameter Efficient Visual Backbones. CVPR, 2021. [arXiv:2103.12731](https://arxiv.org/abs/2103.12731). Halo-style donor support; WSR uses learned coarse K/V tokens rather than claiming to reproduce HaloNet.
+[3] A. Vaswani et al. Scaling Local Self-Attention for Parameter Efficient Visual Backbones. CVPR, 2021. [arXiv:2103.12731](https://arxiv.org/abs/2103.12731).
 
-[4] X. Ding et al. Diverse Branch Block: Building a Convolution as an Inception-like Unit. CVPR, 2021. [arXiv:2103.13425](https://arxiv.org/abs/2103.13425). General structural-reparameterization background; WSR uses Conv3XC, not EDBB.
+[4] X. Ding et al. Diverse Branch Block: Building a Convolution as an Inception-like Unit. CVPR, 2021. [arXiv:2103.13425](https://arxiv.org/abs/2103.13425).
