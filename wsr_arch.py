@@ -40,11 +40,38 @@ from traiNNer.utils.registry import ARCH_REGISTRY
 # Linear projections and residual/context components.
 
 
+def _composed_conv(
+    x: Tensor,
+    module: Conv3XC | FoldableRGB5,
+    dtype: torch.dtype,
+    stride: int,
+    padding: int,
+) -> Tensor:
+    """Convolve once with a kernel composed from branch parameters by autograd.
+
+    Composition runs in FP32 (FP64 for double parameters) outside autocast and
+    is cast back to the parameter dtype; autocast then handles the convolution
+    as it would an ordinary layer. The kernel follows the input's memory format
+    so cuDNN does not convert it on every call.
+    """
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight, bias = module.composed(torch.promote_types(dtype, torch.float32))
+    layout = (
+        torch.channels_last
+        if x.is_contiguous(memory_format=torch.channels_last)
+        else torch.contiguous_format
+    )
+    weight = weight.to(dtype).contiguous(memory_format=layout)
+    return F.conv2d(x, weight, bias.to(dtype), stride=stride, padding=padding)
+
+
 class Conv3XC(nn.Module):
     """Reparameterizable 1x1 -> 3x3 -> 1x1 projection with a 1x1 skip.
 
-    Training evaluates both branches explicitly, padding before the first
-    biased projection. Evaluation refreshes a cached 3x3 convolution from those
+    Training composes both branches into one 3x3 kernel on every forward, with
+    gradients reaching the branch factors through the composition; this equals
+    padding before the first biased projection and evaluating the branches
+    explicitly. Evaluation refreshes a cached 3x3 convolution from those
     parameters. WSR's export preparation instead folds a separate eval copy
     permanently; the training branches remain the checkpoint source of truth.
     """
@@ -151,11 +178,30 @@ class Conv3XC(nn.Module):
         self.eval_conv.weight.data = self.weight_concat.contiguous()
         self.eval_conv.bias.data = self.bias_concat.contiguous()  # pyright: ignore[reportOptionalMemberAccess]
 
+    def composed(self, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """Compose the branches into one 3x3 kernel and bias, keeping autograd.
+
+        The bias includes the first projection's bias read through the 3x3
+        taps, which the explicit branches see on the padded border as well.
+        """
+        first, spatial, last = self.conv
+        w1 = first.weight.to(dtype).flatten(1)
+        w2 = spatial.weight.to(dtype)
+        w3 = last.weight.to(dtype).flatten(1)
+        mid, inner = w2.shape[:2]
+        # Taps-major factors are views of channels-last weights; the product
+        # (out, 3, 3, in) is the channels-last layout of the 3x3 kernel.
+        taps = w2.permute(0, 2, 3, 1).reshape(mid * 9, inner) @ w1
+        kernel = (w3 @ taps.reshape(mid, -1)).reshape(w3.shape[0], 9, -1)
+        kernel[:, 4] += self.sk.weight.to(dtype).flatten(1)
+        weight = kernel.unflatten(1, (3, 3)).permute(0, 3, 1, 2)
+        bias = w3 @ (w2.sum(dim=(2, 3)) @ first.bias.to(dtype) + spatial.bias.to(dtype))
+        bias = bias + last.bias.to(dtype) + self.sk.bias.to(dtype)
+        return weight, bias
+
     def forward(self, x: Tensor) -> Tensor:
         if self.training:
-            pad = 1
-            x_pad = F.pad(x, (pad, pad, pad, pad), "constant", 0)
-            out = self.conv(x_pad) + self.sk(x)
+            out = _composed_conv(x, self, self.sk.weight.dtype, self.stride, padding=1)
         else:
             self.update_params()
             out = self.eval_conv(x)
@@ -216,6 +262,7 @@ class FoldableRGB5(nn.Module):
 
     Two valid 3x3 operators share one initial two-pixel pad. With no intermediate
     activation, their kernels and biases can be composed into one 5x5 operator.
+    Training runs that composition with autograd on every forward.
     """
 
     def __init__(self, cout: int, middle: int = 64) -> None:
@@ -223,7 +270,26 @@ class FoldableRGB5(nn.Module):
         self.first = ValidConv3XC(3, middle)
         self.second = ValidConv3XC(middle, cout)
 
+    def composed(self, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """Compose both valid operators into one 5x5 kernel and bias."""
+        first, first_bias = self.first.composed(dtype)
+        second, second_bias = self.second.composed(dtype)
+        # Full (flipped) convolution of the two kernels over the middle channels.
+        weight = F.conv2d(
+            first.transpose(0, 1), second.flip(2, 3), padding=2
+        ).transpose(0, 1)
+        bias = second.sum((2, 3)) @ first_bias + second_bias
+        return weight, bias
+
     def forward(self, x: Tensor) -> Tensor:
+        # Only this module's own operators compose; a subclass may hold others.
+        composable = isinstance(self.first, ValidConv3XC) and isinstance(
+            self.second, ValidConv3XC
+        )
+        if self.training and composable:
+            return _composed_conv(
+                x, self, self.first.sk.weight.dtype, stride=1, padding=2
+            )
         return self.second(self.first(F.pad(x, (2, 2, 2, 2))))
 
     @torch.no_grad()
@@ -265,12 +331,33 @@ class WideResidualBlock(nn.Module):
         return x + self.project(F.relu(self.expand(x)))
 
 
+def _upsample4(x: Tensor, dim: int) -> Tensor:
+    """4x bilinear upsampling (align_corners=False) along dim -1 or -2.
+
+    Output 4i+p reads source i + (2p - 3)/8 with clamped edges, so each phase
+    is a fixed blend of the previous, centre and next samples. Neighbours come
+    from sliced concatenation; the compiler fuses the blend into pointwise
+    kernels whose backward needs no scatter.
+    """
+    n = x.shape[dim]
+    prev = torch.cat((x.narrow(dim, 0, 1), x.narrow(dim, 0, n - 1)), dim)
+    after = torch.cat((x.narrow(dim, 1, n - 1), x.narrow(dim, n - 1, 1)), dim)
+    phases = (
+        0.375 * prev + 0.625 * x,
+        0.125 * prev + 0.875 * x,
+        0.875 * x + 0.125 * after,
+        0.625 * x + 0.375 * after,
+    )
+    return torch.stack(phases, dim=dim).flatten(dim - 1, dim)
+
+
 class ContextGate(nn.Module):
     """Modulate full-resolution features with an LR/4 context map.
 
     The gain is 2*sigmoid(gamma + local_scale*x), followed by an additive beta.
     Zero-initialized projections and local_scale make the initial gate identity.
     Cropping the 4x-interpolated map handles input sizes not divisible by four.
+    Training upsamples with an exact separable blend instead of interpolate.
     """
 
     def __init__(self, channels: int, context_channels: int) -> None:
@@ -281,12 +368,13 @@ class ContextGate(nn.Module):
         nn.init.zeros_(self.project.bias)
 
     def forward(self, x: Tensor, context: Tensor) -> Tensor:
-        maps = F.interpolate(
-            self.project(context),
-            scale_factor=4.0,
-            mode="bilinear",
-            align_corners=False,
-        )
+        maps = self.project(context)
+        if self.training:
+            maps = _upsample4(_upsample4(maps, -2), -1)
+        else:
+            maps = F.interpolate(
+                maps, scale_factor=4.0, mode="bilinear", align_corners=False
+            )
         # Always crop dynamically: padded coarse cells need not fill a frame.
         gamma, beta = maps[..., : x.shape[-2], : x.shape[-1]].chunk(2, dim=1)
         return x * (2.0 * torch.sigmoid(gamma + self.local_scale * x)) + beta

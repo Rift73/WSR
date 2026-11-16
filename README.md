@@ -1,6 +1,6 @@
 # WSR: Wide Residual Super-Resolution with Multiscale Context and Halo Retrieval
 
-Rift73 | Technical report | 29 October 2026
+Rift73 | Technical report | 17 November 2026
 
 [Typeset paper (PDF)](WSR.pdf) · [Architecture](wsr_arch.py) · [License](LICENSE)
 
@@ -115,7 +115,7 @@ flowchart TB
 
 ### 3.1  Scheduled affine modulation
 
-For D trunk stages and S gates, gate positions are p<sub>j</sub>=ceil(jD/S), j=1...S. The corresponding zero-based context index is q<sub>j</sub>=ceil(4p<sub>j</sub>/D)-1. A pointwise projection produces gamma and beta, bilinearly upsampled by four with align_corners=False and cropped to the trunk extent. The output is:
+For D trunk stages and S gates, gate positions are p<sub>j</sub>=ceil(jD/S), j=1...S. The corresponding zero-based context index is q<sub>j</sub>=ceil(4p<sub>j</sub>/D)-1. A pointwise projection produces gamma and beta, bilinearly upsampled by four with align_corners=False and cropped to the trunk extent. Training evaluates this upsampling as fixed two-tap blends along each axis (weights 3/8 and 5/8, or 1/8 and 7/8, with clamped edges), which is the same linear map and keeps scatter operations out of the backward pass; evaluation uses the library interpolation. The output is:
 
 Gate(z,c) = z ⊙ [2 sigmoid(γ(c) + a ⊙ z)] + β(c).   (5)
 
@@ -169,16 +169,15 @@ Only the value rows of the K/V projection start at zero. The attention residual 
 
 ## 5  Conv3XC and exact linear folding
 
-Conv3XC is carried from the SPAN implementation lineage [2]. It sums a 1 x 1 skip and a linear 1x1-3x3-1x1 branch. WSR uses gain two: the first projection expands the input-channel count by two and the middle projection produces twice the final output-channel count. There is no activation inside these projections. In training, both branches execute on feature maps. Linear branch composition is an instance of structural reparameterization [4].
+Conv3XC is carried from the SPAN implementation lineage [2]. It sums a 1 x 1 skip and a linear 1x1-3x3-1x1 branch. WSR uses gain two: the first projection expands the input-channel count by two and the middle projection produces twice the final output-channel count. There is no activation inside these projections. Training does not execute the branches on feature maps: on every step the module composes the equivalent dense kernel and bias of (7) from its factors, with gradients carried through the composition to the factors, and applies one convolution. This equals executing the branches up to floating-point rounding. Linear branch composition is an instance of structural reparameterization [4].
 
 ```mermaid
 flowchart TB
   subgraph TRAIN["Training"]
-    X["Input"] --> PAD["Pad before first biased projection"]
-    PAD --> A["Linear 1x1 expansion"] --> B["Linear 3x3"] --> C["Linear 1x1 projection"]
-    X --> SK["1x1 skip"]
-    C --> SUM["Add branches"]
-    SK --> SUM
+    FAC["Factors: 1x1 expansion, 3x3, 1x1 projection, 1x1 skip"] --> CMP["Compose kernel and bias on every step (7)"]
+    CMP --> CONV["One dense 3x3 convolution"]
+    X["Input"] --> CONV
+    CONV -. "gradients through the composition" .-> FAC
   end
   subgraph DEPLOY["Deployment"]
     K["Algebraically compose weights and biases"] --> D["One dense 3x3 convolution"]
@@ -188,20 +187,20 @@ flowchart TB
   NOTE["ReLU, wide activations, gates and Halo remain.<br/>Valid RGB chains fold separately to 5x5."] -.-> D
 ```
 
-*Figure 5. Conv3XC training and deployment forms. The independent wide residual activation in (1) remains after folding. Linear composition changes execution, not the surrounding architecture.*
+*Figure 5. Conv3XC training and deployment forms. Training composes the dense kernel from the factors on every step; deployment composes it once and removes the factors. The independent wide residual activation in (1) remains after folding. Linear composition changes execution, not the surrounding architecture.*
 
 Let A, B<sub>uv</sub>, C denote first pointwise, middle spatial, and last pointwise weights, with biases a, b, c. Let S and d denote the pointwise skip. The equivalent dense kernel and bias are:
 
 W<sub>uv</sub> = C B<sub>uv</sub> A + δ<sub>u0,v0</sub> S
 b<sub>eff</sub> = C[(Σ<sub>uv</sub> B<sub>uv</sub>)a + b] + c + d.   (7)
 
-The boundary rule is essential. The training path zero-pads the input before the first biased pointwise projection, then applies the middle convolution without padding. Thus padded features include the first projection's bias, and (7) remains valid at borders. Padding the intermediate features with zeros after that projection would generally define a different operator.
+The boundary rule is essential. The operator being composed zero-pads the input before the first biased pointwise projection, then applies the middle convolution without padding. Thus padded features include the first projection's bias, and (7) remains valid at borders: one convolution with zero padding of one and bias b<sub>eff</sub> computes the same function. Padding the intermediate features with zeros after that projection would generally define a different operator.
 
 ### 5.1  Effective 5 x 5 RGB paths
 
-Default and Compact contain two FoldableRGB5 modules: one feeds the first wide expansion and one supplies the additive reconstruction base. Each composes two valid 3 x 3 Conv3XC operators after a single two-pixel input pad. The skip in a valid operator is cropped by one pixel. No intermediate nonlinearity is present, so the full chain folds to a single 5 x 5 convolution.
+Default and Compact contain two FoldableRGB5 modules: one feeds the first wide expansion and one supplies the additive reconstruction base. Each composes two valid 3 x 3 Conv3XC operators after a single two-pixel input pad. The skip in a valid operator is cropped by one pixel. No intermediate nonlinearity is present, so the full chain folds to a single 5 x 5 convolution. Training composes that 5 x 5 kernel from the factors on every step in the same way.
 
-Export composition uses FP64 before casting back to the source dtype. Linear factors fold away; wide activations, ReLU, gates, context, and Halo remain. Floating-point rounding can differ between the explicit and folded forms. Training the factors also follows a different optimization trajectory from training the folded kernel directly.
+Training composes in at least FP32 with autocast disabled and casts the kernel to the parameter dtype; export composition uses FP64 before casting back to the source dtype. In export, linear factors fold away; wide activations, ReLU, gates, context, and Halo remain. Floating-point rounding can differ between these compositions and the explicit branch form. Training the factors also follows a different optimization trajectory from training the folded kernel directly.
 
 ## 6  Precision, deployment, and limitations
 
@@ -209,7 +208,7 @@ Export composition uses FP64 before casting back to the source dtype. Linear fac
 
 | State | Conv3XC / RGB chains | Halo scores |
 |---|---|---|
-| Training | Explicit linear branches; gradients on factors | At least FP32 score accumulation and softmax |
+| Training | Kernel composed from the factors on every step, one convolution; gradients on factors | At least FP32 score accumulation and softmax |
 | Ordinary eval | Conv3XC refreshes cached kernel; RGB chain remains explicit | At least FP32, as in training |
 | Prepared export | Static 3x3/5x5 convolutions; factors removed | Model-dtype matmul/softmax; cached temperature |
 
@@ -233,10 +232,10 @@ This report describes the architecture; it does not present quality or runtime b
 
 | Source component | Responsibility |
 |---|---|
-| Conv3XC / _fold_conv3xc | Training branches and static 3x3 composition |
-| ValidConv3XC / FoldableRGB5 | Valid RGB chains and 5x5 export |
+| Conv3XC / _composed_conv / _fold_conv3xc | Per-step training composition, one 3x3 convolution; static 3x3 export |
+| ValidConv3XC / FoldableRGB5 | Valid RGB chains; per-step 5x5 training composition and 5x5 export |
 | WideResidualBlock | Wide nonlinear trunk/context transform |
-| ContextGate | Identity-initialized coarse affine modulation |
+| ContextGate / _upsample4 | Identity-initialized coarse affine modulation; two-tap training blend |
 | BlockTokenAttention | Fine queries, Halo donor packing, mask lane |
 | WESR | Default/Compact trunk, context, Halo, RGB base |
 | WideContextSR | Three context-only presets |
